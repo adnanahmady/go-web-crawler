@@ -19,9 +19,15 @@ type LinkStatus struct {
 	URL        string
 	StatusCode int
 	Error      error
+	Depth      int
 }
 
-var visitedURLs = struct {
+type CrawlJob struct {
+	URL   string
+	Depth int
+}
+
+var visited = struct {
 	sync.Mutex
 	urls map[string]struct{}
 }{
@@ -51,103 +57,110 @@ func main() {
 	fmt.Printf("Base domain for internal links: %s\n", baseURL)
 
 	// Channels
-	// 'toProcess' sends URLs to worker goroutines
-	toProcess := make(chan string)
-	// 'results' sends LinkStatus results back from workers
+	jobs := make(chan CrawlJob)
 	results := make(chan LinkStatus)
-	// 'done' signals when a worker has finished its current URL
-	workerDone := make(chan struct{})
+
+	var wg sync.WaitGroup
 
 	// Start worker goroutines
 	for i := 0; i < *workers; i++ {
-		go worker(toProcess, results, workerDone, baseURL)
+		go worker(jobs, results)
 	}
 
-	go func() {
-		toProcess <- *startURLStr
-	}()
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	go func() {
-		activeCrawls := 0
-		for {
-			select {
-			case status := <-results:
-				printLinkStatus(status)
-				activeCrawls--
-				if activeCrawls == 0 && *depth > 0 {
-					wg.Done()
-				}
-			case <-workerDone:
-			case <-time.After(5 * time.Second):
-				if activeCrawls == 0 && len(toProcess) == 0 {
-					fmt.Println("No more URLs to process. Shutting down.")
-					close(toProcess)
-					return
-				}
-			}
-			if activeCrawls == 0 && len(toProcess) == 0 {
-				time.Sleep(100 * time.Millisecond)
-				if activeCrawls == 0 && len(toProcess) == 0 {
-					fmt.Println("No more URLs to process. Shutting down.")
-					close(toProcess)
-					return
-				}
-			}
-		}
-	}()
+	manager(&wg, jobs, results, *startURLStr, *depth)
 
 	wg.Wait()
+	close(jobs)
+	close(results)
 	fmt.Println("Crawl completed successfully.")
 }
 
-// worker fetches a URL, extracts links, and sends results/new URLs
-func worker(toProcess chan string, results chan<- LinkStatus, workerDone chan<- struct{}, baseURL string) {
-	client := &http.Client{Timeout: 10 * time.Second} // HTTP client with a timeout
+func manager(
+	wg *sync.WaitGroup,
+	jobs chan<- CrawlJob,
+	results <-chan LinkStatus,
+	startURL string,
+	maxDepth int,
+) {
+	pendingJobs := make(map[string]struct{})
+	var mu sync.Mutex
 
-	for urlStr := range toProcess {
-		func() {
-			defer func() {
-				workerDone <- struct{}{} // Signal that this worker is done with current URL
-			}()
+	mu.Lock()
+	pendingJobs[startURL] = struct{}{}
+	mu.Unlock()
+	wg.Add(1)
+	jobs <- CrawlJob{URL: startURL, Depth: 0}
 
-			visitedURLs.Lock()
-			if _, seen := visitedURLs.urls[urlStr]; seen {
-				visitedURLs.Unlock()
-				return // Already visited
-			}
-			visitedURLs.urls[urlStr] = struct{}{}
-			visitedURLs.Unlock()
+	go func() {
+		for result := range results {
+			printLinkStatus(result)
 
-			status := checkURL(client, urlStr)
-			results <- status // Send result back
+			mu.Lock()
+			delete(pendingJobs, result.URL)
+			mu.Unlock()
 
-			if status.Error == nil && status.StatusCode >= 200 && status.StatusCode < 300 {
-				newLinks := extractLinks(client, urlStr, baseURL)
+			if result.Error == nil &&
+				result.StatusCode >= 200 &&
+				result.StatusCode < 300 &&
+				result.StatusCode != http.StatusNoContent &&
+				result.Depth < maxDepth {
+				newLinks := extractLinks(
+					http.DefaultClient,
+					result.URL,
+					strings.Split(result.URL, "://")[0]+"://"+strings.Split(result.URL, "/")[2],
+				)
+
 				for _, link := range newLinks {
-					toProcess <- link
+					link = strings.TrimSuffix(link, "/")
+					visited.Lock()
+					_, seen := visited.urls[link]
+					visited.Unlock()
+
+					if !seen {
+						mu.Lock()
+						if _, isPending := pendingJobs[link]; !isPending {
+							pendingJobs[link] = struct{}{}
+							wg.Add(1)
+							go func() { jobs <- CrawlJob{URL: link, Depth: result.Depth + 1} }()
+						}
+						mu.Unlock()
+					}
 				}
 			}
-		}()
+			wg.Done()
+		}
+	}()
+}
+
+// worker fetches a URL, extracts links, and sends results/new URLs
+func worker(jobs <-chan CrawlJob, results chan<- LinkStatus) {
+	client := &http.Client{Timeout: 10 * time.Second} // HTTP client with a timeout
+
+	for job := range jobs {
+		visited.Lock()
+		visited.urls[job.URL] = struct{}{}
+		visited.Unlock()
+
+		status := checkURL(client, job.URL, job.Depth)
+
+		results <- status
 	}
 }
 
-func checkURL(client *http.Client, urlStr string) LinkStatus {
+func checkURL(client *http.Client, urlStr string, depth int) LinkStatus {
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
-		return LinkStatus{URL: urlStr, Error: fmt.Errorf("failed to create request: %w", err)}
+		return LinkStatus{URL: urlStr, Error: fmt.Errorf("failed to create request: %w", err), Depth: depth}
 	}
 	req.Header.Set("User-Agent", "Go-Web-Crawler/1.0 (https://github.com/adnanahmady/go-web-crawler)")
 
 	res, err := client.Do(req)
 	if err != nil {
-		return LinkStatus{URL: urlStr, Error: fmt.Errorf("failed to fetch URL: %w", err)}
+		return LinkStatus{URL: urlStr, Error: fmt.Errorf("failed to fetch URL: %w", err), Depth: depth}
 	}
 	defer res.Body.Close()
 
-	return LinkStatus{URL: urlStr, StatusCode: res.StatusCode}
+	return LinkStatus{URL: urlStr, StatusCode: res.StatusCode, Depth: depth}
 }
 
 func extractLinks(client *http.Client, parentURL string, baseURL string) []string {
@@ -198,9 +211,10 @@ func extractLinks(client *http.Client, parentURL string, baseURL string) []strin
 }
 
 func printLinkStatus(status LinkStatus) {
+	prefix := fmt.Sprintf("[%d] ", status.Depth)
 	if status.Error != nil {
-		log.Printf("Error for %s: %v\n", status.URL, status.Error)
+		log.Printf("%sError for %s: %v\n", prefix, status.URL, status.Error)
 	} else {
-		log.Printf("Status for %s: %d\n", status.URL, status.StatusCode)
+		log.Printf("%sStatus for %s: %d\n", prefix, status.URL, status.StatusCode)
 	}
 }
